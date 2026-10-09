@@ -1,0 +1,15 @@
+IMPORTANT: LIVE DEMO ACCESS FOR THE JURY
+
+SalesOS is deployed on Railway and the dashboard is available here:
+https://salesos-production-4e28.up.railway.app/admin
+
+Demo dashboard password: admin
+
+This is a post-submission update providing access to the live demo.
+Deployment and public domain configuration were completed after submission.
+This commit adds only this notice; it does not change the submitted application
+source code. The submitted source snapshot is commit d0aeba2.
+
+The demo uses Telegram for customer interaction and the dashboard for viewing
+conversations and recorded orders. Orders are recorded for manual fulfillment;
+no payment is processed.
