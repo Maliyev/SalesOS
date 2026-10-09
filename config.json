@@ -1,0 +1,42 @@
+{
+  "gemini": {
+    "model": "gemini-3.5-flash-lite",
+    "retry": {
+      "delays": [
+        1,
+        3,
+        5
+      ],
+      "max_wait_seconds": 15
+    },
+    "thinking_level": "minimal",
+    "tpm_limit": 0,
+    "vision_model": ""
+  },
+  "limits": {
+    "context_overflow": {
+      "auto_compaction": true,
+      "auto_reset": true,
+      "compaction_model": "",
+      "context_token_limit": 25000,
+      "list_context_token_limit": 10000
+    },
+    "list_mode_enabled": false,
+    "max_api_calls_per_reply": 15,
+    "max_search_rounds": 10,
+    "message_rate": {
+      "max_messages": 15,
+      "window_seconds": 60
+    },
+    "token_abuse": {
+      "limit": 0,
+      "window_seconds": 60
+    }
+  },
+  "openrouter": {
+    "allowed_numbers": [],
+    "enabled": false,
+    "model": "z-ai/glm-5.3-flash",
+    "reasoning_effort": "low"
+  }
+}

@@ -1,0 +1,703 @@
+import json
+import os
+from pathlib import Path
+import threading
+import time
+from types import SimpleNamespace
+
+import requests
+
+from agent import AgentError
+from app_config import get_gemini_model, get_vision_model
+from app_logging import configure_logging, get_logger
+from config import load_env_file
+from database import (
+    DatabaseError,
+    initialize_database,
+    insert_incoming_message,
+    record_agent_turn,
+    reset_history,
+    save_model_message,
+    update_messages_status,
+)
+from document_reader import (
+    MAX_DOCUMENT_FILE_SIZE,
+    DocumentReadError,
+    build_document_user_text,
+    extract_document_text,
+    is_supported_document,
+)
+from image_reader import (
+    MAX_IMAGE_FILE_SIZE,
+    ImageReadError,
+    build_image_user_text,
+    is_image,
+    resolve_mime_type,
+)
+from image_reader import describe_image as describe_image_bytes
+from message_guard import is_message_allowed
+from message_service import generate_customer_reply
+from product_search import ProductSearchError
+from prompts import load_prompt_file, load_system_instruction
+from reply_delivery import deliver_agent_reply
+from session_coordinator import SessionCoordinator
+
+
+DATABASE_PATH = Path(__file__).resolve().parents[1] / "data" / "sales_agent.db"
+LOG_PATH = Path(__file__).resolve().parents[1] / "data" / "logs" / "sales_agent.log"
+CONVERSATION_LOG_PATH = (
+    Path(__file__).resolve().parents[1] / "data" / "logs" / "conversations.log"
+)
+POLL_TIMEOUT_SECONDS = 25
+MAX_MESSAGE_LENGTH = 4000
+PHOTO_MIME_TYPE = "image/jpeg"
+TEXT_ONLY_REPLY = (
+    "Hazırda mətn mesajlarını, şəkilləri və .xlsx/.docx sənədlərini "
+    "oxuya bilirəm."
+)
+UNSUPPORTED_DOCUMENT_REPLY = (
+    "Bu fayl formatını oxuya bilmirəm. Zəhmət olmasa .xlsx və ya "
+    ".docx formatında göndərin."
+)
+UNREADABLE_DOCUMENT_REPLY = (
+    "Sənədi oxuya bilmirəm. Zəhmət olmasa faylı yenidən göndərin."
+)
+UNREADABLE_IMAGE_REPLY = (
+    "Şəkli emal edə bilmirəm. Zəhmət olmasa sorğunuzu mətn şəklində yazın."
+)
+OVERSIZED_DOCUMENT_REPLY = (
+    "Fayl çox böyükdür. Zəhmət olmasa 5 MB-dan kiçik fayl göndərin."
+)
+DELIVERY_FAILURE_REPLY = (
+    "Hazırda cavab verə bilmirəm. Zəhmət olmasa bir az sonra "
+    "yenidən cəhd edin."
+)
+LIST_PROCESSING_NOTICE = (
+    "Sorğunuz emal olunur, bu bir neçə dəqiqə çəkə bilər.\n"
+    "Ваш запрос обрабатывается, это может занять несколько минут."
+)
+logger = get_logger("telegram")
+
+
+class TelegramError(RuntimeError):
+    pass
+
+
+def get_updates(token, offset=None, session=requests):
+    params = {
+        "timeout": POLL_TIMEOUT_SECONDS,
+        "allowed_updates": json.dumps(["message"]),
+    }
+    if offset is not None:
+        params["offset"] = offset
+
+    result = _telegram_request(
+        token,
+        "getUpdates",
+        session.get,
+        params=params,
+        timeout=POLL_TIMEOUT_SECONDS + 5,
+    )
+    if not isinstance(result, list):
+        raise TelegramError("Telegram returned an invalid update list.")
+    return result
+
+
+def send_message(token, chat_id, text, session=requests):
+    for chunk in split_message(text):
+        _telegram_request(
+            token,
+            "sendMessage",
+            session.post,
+            json={"chat_id": chat_id, "text": chunk},
+            timeout=15,
+        )
+
+
+def split_message(text):
+    if not isinstance(text, str) or not text:
+        raise TelegramError("Telegram message must not be empty.")
+    return [
+        text[start : start + MAX_MESSAGE_LENGTH]
+        for start in range(0, len(text), MAX_MESSAGE_LENGTH)
+    ]
+
+
+def handle_update(
+    update,
+    submit_fn,
+    reset_fn,
+    send_fn,
+    allow_fn=None,
+    download_document_fn=None,
+    read_document_fn=None,
+    describe_image_fn=None,
+):
+    if not isinstance(update, dict):
+        return
+
+    message = update.get("message")
+    if not isinstance(message, dict):
+        return
+
+    chat = message.get("chat")
+    if not isinstance(chat, dict):
+        return
+    chat_id = chat.get("id")
+    if isinstance(chat_id, bool) or not isinstance(chat_id, int):
+        return
+
+    photo = message.get("photo")
+    if isinstance(photo, list) and photo:
+        photo_size = _largest_photo_size(photo)
+        if photo_size is not None:
+            _handle_image_message(
+                message,
+                photo_size.get("file_id"),
+                PHOTO_MIME_TYPE,
+                photo_size.get("file_size"),
+                chat_id,
+                submit_fn,
+                send_fn,
+                allow_fn,
+                download_document_fn,
+                describe_image_fn,
+                "photo",
+            )
+            return
+
+    document = message.get("document")
+    if isinstance(document, dict):
+        _handle_document_message(
+            message,
+            document,
+            chat_id,
+            submit_fn,
+            send_fn,
+            allow_fn,
+            download_document_fn,
+            read_document_fn,
+            describe_image_fn,
+        )
+        return
+
+    text = message.get("text")
+    if not isinstance(text, str) or not text.strip():
+        send_fn(chat_id, TEXT_ONLY_REPLY)
+        return
+
+    text = text.strip()
+    session_id = f"telegram:{chat_id}"
+    if allow_fn is not None and not allow_fn(session_id):
+        logger.warning(
+            "🚫 Telegram session blocked by message guard | session=%s",
+            session_id,
+        )
+        return
+
+    command = text.split(maxsplit=1)[0].split("@", maxsplit=1)[0].lower()
+
+    if command == "/start":
+        send_fn(
+            chat_id,
+            "Salam! Mən SalesOS satış köməkçisiyəm. Məhsullar haqqında sual verə "
+            "bilərsiniz. Söhbəti silmək üçün /reset yazın.",
+        )
+        return
+
+    if command == "/reset":
+        reset_fn(session_id)
+        logger.info(
+            "🧹 Telegram session reset | session=%s",
+            session_id,
+        )
+        send_fn(chat_id, "Söhbət tarixçəsi silindi.")
+        return
+
+    if command.startswith("/") and command != "/confirm":
+        send_fn(chat_id, "Naməlum əmr. Mövcud əmr: /reset")
+        return
+
+    submit_fn(session_id, text, chat_id)
+
+
+def _handle_document_message(
+    message,
+    document,
+    chat_id,
+    submit_fn,
+    send_fn,
+    allow_fn,
+    download_document_fn,
+    read_document_fn,
+    describe_image_fn,
+):
+    session_id = f"telegram:{chat_id}"
+    if allow_fn is not None and not allow_fn(session_id):
+        logger.warning(
+            "🚫 Telegram session blocked by message guard | session=%s",
+            session_id,
+        )
+        return
+
+    file_name = document.get("file_name")
+    if not isinstance(file_name, str) or not file_name.strip():
+        file_name = "document"
+
+    mime_type = resolve_mime_type(file_name, document.get("mime_type"))
+    if is_image(mime_type, file_name):
+        _handle_image_message(
+            message,
+            document.get("file_id"),
+            mime_type,
+            document.get("file_size"),
+            chat_id,
+            submit_fn,
+            send_fn,
+            allow_fn,
+            download_document_fn,
+            describe_image_fn,
+            file_name,
+        )
+        return
+
+    if not is_supported_document(file_name):
+        logger.info(
+            "➖ Ignored unsupported Telegram document | filename=%s",
+            file_name,
+        )
+        send_fn(chat_id, UNSUPPORTED_DOCUMENT_REPLY)
+        return
+
+    if _is_oversized_document(document.get("file_size")):
+        send_fn(chat_id, OVERSIZED_DOCUMENT_REPLY)
+        return
+
+    file_id = document.get("file_id")
+    if not isinstance(file_id, str) or not file_id:
+        send_fn(chat_id, UNREADABLE_DOCUMENT_REPLY)
+        return
+
+    try:
+        data = download_document_fn(file_id)
+    except (TelegramError, requests.RequestException) as error:
+        logger.error(
+            "❌ Could not download Telegram document | filename=%s error=%s",
+            file_name,
+            error,
+        )
+        send_fn(chat_id, DELIVERY_FAILURE_REPLY)
+        return
+
+    if _is_oversized_document(len(data)):
+        send_fn(chat_id, OVERSIZED_DOCUMENT_REPLY)
+        return
+
+    try:
+        extracted_text = read_document_fn(file_name, data)
+    except DocumentReadError as error:
+        logger.warning(
+            "📄 Could not read Telegram document | filename=%s error=%s",
+            file_name,
+            error,
+        )
+        send_fn(chat_id, UNREADABLE_DOCUMENT_REPLY)
+        return
+
+    user_text = build_document_user_text(
+        file_name,
+        extracted_text,
+        message.get("caption"),
+    )
+    logger.info(
+        "📄 Telegram document accepted | session=%s filename=%s chars=%d",
+        session_id,
+        file_name,
+        len(extracted_text),
+    )
+    submit_fn(session_id, user_text, chat_id)
+
+
+def _handle_image_message(
+    message,
+    file_id,
+    mime_type,
+    file_size,
+    chat_id,
+    submit_fn,
+    send_fn,
+    allow_fn,
+    download_document_fn,
+    describe_image_fn,
+    source,
+):
+    session_id = f"telegram:{chat_id}"
+    if allow_fn is not None and not allow_fn(session_id):
+        logger.warning(
+            "🚫 Telegram session blocked by message guard | session=%s",
+            session_id,
+        )
+        return
+
+    if _is_oversized_image(file_size):
+        send_fn(chat_id, OVERSIZED_DOCUMENT_REPLY)
+        return
+
+    if not isinstance(file_id, str) or not file_id:
+        send_fn(chat_id, UNREADABLE_IMAGE_REPLY)
+        return
+
+    try:
+        data = download_document_fn(file_id)
+    except (TelegramError, requests.RequestException) as error:
+        logger.error(
+            "❌ Could not download Telegram image | source=%s error=%s",
+            source,
+            error,
+        )
+        send_fn(chat_id, DELIVERY_FAILURE_REPLY)
+        return
+
+    if _is_oversized_image(len(data)):
+        send_fn(chat_id, OVERSIZED_DOCUMENT_REPLY)
+        return
+
+    try:
+        description = describe_image_fn(data, mime_type, session_id)
+    except ImageReadError as error:
+        logger.warning(
+            "🖼 Could not describe Telegram image | source=%s error=%s",
+            source,
+            error,
+        )
+        send_fn(chat_id, UNREADABLE_IMAGE_REPLY)
+        return
+
+    user_text = build_image_user_text(description, message.get("caption"))
+    logger.info(
+        "🖼 Telegram image accepted | session=%s source=%s desc_chars=%d",
+        session_id,
+        source,
+        len(description),
+    )
+    submit_fn(session_id, user_text, chat_id)
+
+
+def _largest_photo_size(photo_sizes):
+    candidates = [
+        item
+        for item in photo_sizes
+        if isinstance(item, dict)
+        and isinstance(item.get("file_id"), str)
+        and item.get("file_id")
+    ]
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda item: (item.get("width") or 0) * (item.get("height") or 0),
+    )
+
+
+def _is_oversized_document(size):
+    return (
+        isinstance(size, int)
+        and not isinstance(size, bool)
+        and size > MAX_DOCUMENT_FILE_SIZE
+    )
+
+
+def _is_oversized_image(size):
+    return (
+        isinstance(size, int)
+        and not isinstance(size, bool)
+        and size > MAX_IMAGE_FILE_SIZE
+    )
+
+
+def _download_document(token, file_id, session=requests):
+    result = _telegram_request(
+        token,
+        "getFile",
+        session.get,
+        params={"file_id": file_id},
+        timeout=15,
+    )
+    file_path = result.get("file_path") if isinstance(result, dict) else None
+    if not isinstance(file_path, str) or not file_path:
+        raise TelegramError("Telegram returned an invalid file path.")
+
+    url = f"https://api.telegram.org/file/bot{token}/{file_path}"
+    try:
+        response = session.get(url, timeout=30)
+        response.raise_for_status()
+    except requests.RequestException as error:
+        raise TelegramError("Telegram document download failed.") from error
+    return response.content
+
+
+def run_polling(token, update_handler, stop_event=None):
+    offset = None
+    logger.info("🚀 Telegram polling started")
+
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            logger.info("🛑 Telegram polling stopped")
+            return
+
+        try:
+            updates = get_updates(token, offset)
+        except TelegramError as error:
+            if stop_event is not None and stop_event.is_set():
+                logger.info("🛑 Telegram polling stopped")
+                return
+            logger.error("❌ Telegram polling failed: %s", error)
+            time.sleep(3)
+            continue
+
+        for update in updates:
+            update_id = update.get("update_id") if isinstance(update, dict) else None
+            if isinstance(update_id, int) and not isinstance(update_id, bool):
+                offset = update_id + 1
+
+            try:
+                update_handler(update)
+            except (
+                AgentError,
+                DatabaseError,
+                ProductSearchError,
+                TelegramError,
+                requests.RequestException,
+                RuntimeError,
+            ) as error:
+                logger.exception("❌ Could not process Telegram update: %s", error)
+
+
+def build_telegram_channel(
+    database_path,
+    model,
+    api_key,
+    telegram_token,
+    system_instruction,
+    selection_instruction,
+    response_instruction,
+    coordinator=None,
+    max_workers=4,
+):
+    def create_reply(session_id, user_text, in_reply_to_message_id):
+        return generate_customer_reply(
+            database_path,
+            session_id,
+            user_text,
+            get_gemini_model(),
+            api_key,
+            system_instruction,
+            selection_instruction,
+            response_instruction,
+            in_reply_to_message_id=in_reply_to_message_id,
+            list_start_notify_fn=lambda: notify_list_processing(session_id),
+        )
+
+    def notify_list_processing(session_id):
+        send_reply(session_id.split(":", 1)[1], LIST_PROCESSING_NOTICE)
+
+    def save_reply(session_id, reply):
+        return save_model_message(
+            database_path,
+            session_id,
+            reply.customer_reply,
+            status="RESPONSE_READY",
+        )
+
+    if coordinator is None:
+        def mark_messages_status(session_id, message_ids, status):
+            update_messages_status(database_path, message_ids, status)
+
+        coordinator = SessionCoordinator(
+            create_reply,
+            save_reply,
+            mark_messages_status=mark_messages_status,
+            record_turn=lambda session_id: record_agent_turn(database_path, session_id),
+            max_workers=max_workers,
+        )
+
+    def send_reply(chat_id, text):
+        send_message(telegram_token, chat_id, text)
+
+    def note_operator_request(session_id, message):
+        logger.info(
+            "❗ Operator handoff recorded | session=%s summary_chars=%d",
+            session_id,
+            len(message),
+        )
+
+    def report_error(chat_id, error):
+        logger.error(
+            "❌ Could not process Telegram message | error_type=%s error=%s",
+            type(error).__name__,
+            error,
+        )
+        try:
+            send_reply(chat_id, DELIVERY_FAILURE_REPLY)
+        except TelegramError as send_error:
+            logger.error("❌ Could not send Telegram error message: %s", send_error)
+
+    def submit_message(session_id, user_text, chat_id):
+        try:
+            message_id = insert_incoming_message(database_path, session_id, user_text)
+        except DatabaseError as error:
+            logger.error(
+                "❌ Could not store the message | session=%s error=%s",
+                session_id,
+                error,
+            )
+            report_error(chat_id, error)
+            return
+
+        coordinator.submit(
+            session_id,
+            message_id,
+            user_text,
+            lambda reply: deliver_agent_reply(
+                chat_id,
+                session_id,
+                reply,
+                send_reply,
+                note_operator_request,
+            ),
+            lambda error: report_error(chat_id, error),
+        )
+
+    def clear_history(session_id):
+        coordinator.reset_session(
+            session_id,
+            lambda: reset_history(database_path, session_id),
+        )
+
+    def download_document(file_id):
+        return _download_document(telegram_token, file_id)
+
+    def read_document(filename, data):
+        return extract_document_text(filename, data)
+
+    def describe_image(data, mime_type, session_id):
+        return describe_image_bytes(
+            data,
+            mime_type,
+            get_vision_model(),
+            api_key,
+            database_path,
+            session_id,
+        )
+
+    def process_update(update):
+        handle_update(
+            update,
+            submit_message,
+            clear_history,
+            send_reply,
+            lambda session_id: is_message_allowed(database_path, session_id),
+            download_document_fn=download_document,
+            read_document_fn=read_document,
+            describe_image_fn=describe_image,
+        )
+
+    stop_event = threading.Event()
+
+    def run():
+        run_polling(telegram_token, process_update, stop_event)
+
+    def start():
+        thread = threading.Thread(target=run, name="telegram-bot", daemon=True)
+        thread.start()
+        return thread
+
+    def stop():
+        stop_event.set()
+
+    def shutdown():
+        coordinator.shutdown()
+
+    return SimpleNamespace(
+        name="telegram",
+        notify_list_processing=notify_list_processing,
+        run=run,
+        start=start,
+        stop=stop,
+        shutdown=shutdown,
+    )
+
+
+def get_settings():
+    api_key = os.getenv("GEMINI_API_KEY")
+    telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
+
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is missing. Add it to the .env file.")
+    if not telegram_token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing. Add it to the .env file.")
+
+    return api_key, get_gemini_model(), telegram_token
+
+
+def load_instructions():
+    return (
+        load_system_instruction(),
+        load_prompt_file("prompts/product_selection.md"),
+        load_prompt_file("prompts/product_response.md"),
+    )
+
+
+def main():
+    load_env_file()
+
+    try:
+        configure_logging(LOG_PATH, CONVERSATION_LOG_PATH)
+        api_key, model, telegram_token = get_settings()
+        initialize_database(DATABASE_PATH)
+        system_instruction, selection_instruction, response_instruction = (
+            load_instructions()
+        )
+    except (DatabaseError, RuntimeError) as error:
+        logger.exception("❌ Telegram startup failed | error=%s", error)
+        return
+
+    channel = build_telegram_channel(
+        DATABASE_PATH,
+        model,
+        api_key,
+        telegram_token,
+        system_instruction,
+        selection_instruction,
+        response_instruction,
+    )
+
+    try:
+        channel.run()
+    except KeyboardInterrupt:
+        logger.info("🛑 Telegram bot stopped")
+    finally:
+        channel.shutdown()
+
+
+def _telegram_request(token, method, request_fn, **kwargs):
+    url = f"https://api.telegram.org/bot{token}/{method}"
+
+    try:
+        response = request_fn(url, **kwargs)
+        response.raise_for_status()
+        data = response.json()
+    except (requests.RequestException, ValueError) as error:
+        raise TelegramError(f"Telegram {method} request failed.") from error
+
+    if not isinstance(data, dict) or data.get("ok") is not True:
+        description = data.get("description") if isinstance(data, dict) else None
+        if not isinstance(description, str):
+            description = "Unknown Telegram API error."
+        raise TelegramError(description)
+
+    return data.get("result")
+
+
+if __name__ == "__main__":
+    main()
