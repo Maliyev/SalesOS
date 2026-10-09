@@ -1,25 +1,19 @@
-# Roadmap
+# SalesOS roadmap
 
-- [x] Send one message to Gemini through the REST API.
-- [x] Keep one conversation history in memory.
-- [x] Add a system prompt and base store knowledge.
-- [x] Keep several conversations separate in memory.
-- [x] Save conversations in SQLite.
-- [x] Stop before an oversized history is sent to Gemini.
-- [x] Parse price and stock from elen.az product pages.
-- [x] Return compact details for radio and dropdown product variants.
-- [x] Search products and let the agent filter relevant candidates.
-- [x] Read direct elen.az product links from customer messages.
-- [ ] Improve product choice and answer style using real conversations.
-- [ ] Add conversation context trimming and summaries.
-- [x] Answer several customer sessions concurrently.
-- [x] Add a simple Telegram demo with `/reset`.
-- [x] Block sessions that send more than 15 messages in one minute.
-- [x] Let the agent explicitly request a human operator.
-- [ ] Add Telegram access control and safer error reporting.
-- [ ] Add a website chat.
-- [x] Build the local WhatsApp Cloud API connector.
-- [x] Verify the WhatsApp connector with a registered number and public tunnel.
-- [ ] Deploy the WhatsApp webhook to a permanent HTTPS host.
-- [x] Add readable rotating application logs.
-- [ ] Add a local admin dashboard for sessions and usage statistics.
+## Available
+
+- [x] Gemini-assisted customer conversations.
+- [x] SQLite conversation history and separate customer sessions.
+- [x] Product search, verified prices, stock and selectable variants.
+- [x] Telegram integration and optional WhatsApp connector.
+- [x] Shopping carts and recorded orders.
+- [x] Dashboard with conversations, Orders and usage information.
+- [x] Business knowledge and prompt editing.
+
+## Planned
+
+- [ ] AI Setup Engineer and guided business onboarding.
+- [ ] Generic catalogue adapters.
+- [ ] Website customer chat.
+- [ ] Payment integration.
+- [ ] Further product-choice and conversation-quality improvements.

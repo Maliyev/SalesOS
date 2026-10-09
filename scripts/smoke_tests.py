@@ -1,4 +1,4 @@
-"""Fast demo regressions; retain but exclude the original retired LIST-mode tests."""
+"""SalesOS demo regressions; LIST-mode tests are excluded."""
 from pathlib import Path
 import sys
 import unittest
